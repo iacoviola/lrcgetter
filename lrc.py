@@ -6,3 +6,6 @@ class NoMatchFoundException(LrcException):
 
 class InstrumentalTrackException(LrcException):
     pass
+
+class NoTokenException(LrcException):
+    pass

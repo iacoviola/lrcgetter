@@ -1,12 +1,14 @@
-import os
 import json
-import requests
+import logging
+import os
 
 from time import time
 
-from lrc import NoMatchFoundException
-from song import Song
+from lrc import NoTokenException
 from providers.getter import Getter
+from song import Song
+
+logger = logging.getLogger(__name__)
 
 class Musixmatch(Getter):
     def __init__(self, token_dir: str):
@@ -16,29 +18,22 @@ class Musixmatch(Getter):
         self.api_tok_file = os.path.join(token_dir, 'mxm_api_token.json')
 
     def get_lyrics(self, song: Song, type: str = None):
-        self.__get_api_token()
+        try: self.__get_api_token()
+        except NoTokenException: raise
 
         tracks = self.__search(song.title, song.artist)
-        if not tracks:
-            return None
         compare = lambda t: f"{t['track']['track_name']} {t['track']['artist_name']} {t['track']['album_name']}"
         track = self._get_best_match(tracks, compare, song)
         if not track:
             return None
 
         track_id = track['track']['track_id']
-        lyrics = self.__get_song_lyrics(track_id, type)
-        return lyrics
+        return self.__get_song_lyrics(track_id, type)
 
     def __get_api_token(self):
-        if self.__validate_token():
-            return
-        
-        expiration = lambda t: t['expiration_time']
-        token = self.__find_token(self.api_tok_file, expiration)
-        if token:
-            if not self.api_token:
-                self.api_token = token
+        token = self._find_token(self.api_tok_file)
+        if token and self.api_token:
+            self.api_token = token
             return
 
         headers = { 'Accept': 'application/json' }
@@ -48,41 +43,15 @@ class Musixmatch(Getter):
         body = self._get(url, params=params, headers=headers)
 
         if not body:
-            raise Exception("Failed to get API token")
+            raise NoTokenException('Failed to get API token')
         
         token = {
-            'user_token': body['message']['body']['user_token'],
-            'expiration_time': int(time()) + 600
+            'token': body['message']['body']['user_token'],
+            'expires_at': int(time()) + 600
         }
 
         with open(self.api_tok_file, 'w') as f:
             json.dump(token, f)
-
-    def __find_token(self, token_file, expiration_time):
-        try:
-            with open(token_file, 'r') as f:
-                tok = json.load(f)
-        except FileNotFoundError:
-            return None
-
-        if int(time()) > expiration_time(tok):
-            return None
-
-        return tok['user_token']
-
-    def __validate_token(self):
-        try:
-            with open(self.api_tok_file, 'r') as f:
-                tok = json.load(f)
-        except FileNotFoundError:
-            return False
-
-        if int(time()) > tok['expiration_time']:
-            return False
-
-        if not self.api_token:
-            self.api_token = tok['user_token']
-        return True
     
     def __get_song_lyrics(self, track_id, type):
         headers = { 'Accept': 'application/json' }

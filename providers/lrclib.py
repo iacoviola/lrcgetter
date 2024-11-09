@@ -1,5 +1,5 @@
-import requests
 import logging
+import requests
 
 from providers.getter import Getter
 from song import Song
@@ -7,42 +7,30 @@ from song import Song
 logger = logging.getLogger(__name__)
 
 class Lrclib(Getter):
-    def __init__(self):
-        self.api_ep = 'https://lrclib.net/api/'
 
-        self.user_agent = 'lyrics_getter_cmd, v0.0.0, (no source link yet)'
+    API_EP = 'https://lrclib.net/api'
+    USER_AGENT = 'lyrics_getter_cmd, v0.0.0, (no source link yet)'
 
     def get_lyrics(self, song, type):
         tracks = self.__get_songs(song)
-        track, aff, probs = self._get_chosen_track(tracks, song)
 
-        return track[f"{type}Lyrics"], aff, probs
+        compare = lambda t: f"{t['trackName']} {t['artistName']} {t['albumName']}"
+        track = self._get_best_match(tracks, compare, song)
 
-    def _get_song(self, obj: dict):
-        title = obj['trackName']
-        artist = obj['artistName']
-        album = obj['albumName']
-        duration = obj['duration']
-
-        return Song(title, artist, album, duration)
+        return track[f"{type}Lyrics"]
 
     def __get_songs(self, song: Song):
         params = {
             'track_name': song.title,
             'artist_name': song.artist,
             'album_name': song.album,
-            #"duration": song.duration # Add only for get endpoint
         }
+        headers = { 'User-Agent': self.USER_AGENT }
+        url = f"{self.API_EP}/search"
 
-        headers = {
-            'User-Agent': self.user_agent
-        }
+        body = self._get(url, params, headers)
 
-        response = requests.get(self.api_ep + "search", params=params, headers=headers)
-
-        logger.debug(response.url)
-        if response.status_code != 200:
-            raise Exception(f"Failed to get lyrics, error code:{response.status_code}" + response.text)
-        
-        return response.json()
+        if not body:
+            return None
+        return body
     

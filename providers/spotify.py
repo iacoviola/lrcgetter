@@ -1,21 +1,30 @@
-import requests
 import json
 import logging
 import os
 
 from time import time
 
+from lrc import NoTokenException
 from providers.getter import Getter
 from song import Song
-from lrc import NoMatchFoundException
 
 logger = logging.getLogger(__name__)
 
 class Spotify(Getter):
+
+    API_EP = 'https://api.spotify.com/v1'
+    API_TOK_EP = 'https://accounts.spotify.com/api/token'
+    LRC_TOK_EP = 'https://open.spotify.com/get_access_token?reason=transport&productType=web_player'
+    LRC_EP_HEAD = 'https://spclient.wg.spotify.com/color-lyrics/v2/track'
+    LRC_EP_TAIL = '?format=json&vocalRemoval=false&market=from_token'
+
+    USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Safari/537.36'
+
     def __init__(self, client_id, client_secret, sp_dc, tokens_dir):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.sp_dc = sp_dc
+        self.CLIENT_ID = client_id
+        self.CLIENT_SECRET = client_secret
+        self.SP_DC = sp_dc
+        
         self.api_token = None
         self.lrc_token = None
         self.tokens_dir = tokens_dir
@@ -26,36 +35,26 @@ class Spotify(Getter):
         self.api_tok_file = os.path.join(tokens_dir, 'api_token.json')
         self.lrc_tok_file = os.path.join(tokens_dir, 'lrc_token.json')
 
-        self.api_ep = 'https://api.spotify.com/v1'
-        self.api_tok_ep = 'https://accounts.spotify.com/api/token'
-        self.lrc_tok_ep = 'https://open.spotify.com/get_access_token?reason=transport&productType=web_player'
-        self.lrc_ep = 'https://spclient.wg.spotify.com/color-lyrics/v2/track/'
-        self.lrc_ep_end = '?format=json&vocalRemoval=false&market=from_token'
-
-        self.user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.0.0 Safari/537.36'
-
     def get_lyrics(self, song: Song, type: str = None):
+        try: self.__get_api_token()
+        except NoTokenException: raise
+        
+        tracks = self.__search(song.title, song.artist)        
+        compare = lambda t: f"{t['name']} {' '.join([a['name'] for a in t['artists']])} {t['album']['name']}"
+        track = self._get_best_match(tracks, compare, song)
 
-        self.__obtain_api_token()
-
-        tracks = self.__search(song.title, song.artist)
-
-        track, aff, probs = self._get_chosen_track(tracks, song)
+        if not track:
+            return None
 
         track_url = track['external_urls']['spotify']
+        track_id = track_url.split('/')[-1]
 
-        self.__obtain_lrc_token()
-        lyrics = self.__get_song_lyrics(track_url)
+        try: self.__get_lrc_token()
+        except NoTokenException: raise
 
-        return self.__parse_lyrics(lyrics, type), aff, probs
+        lyrics = self.__get_song_lyrics(track_id)
 
-    def _get_song(self, obj: dict):
-        title = obj['name']
-        artist = ";".join([artist['name'] for artist in obj['artists']])
-        album = obj['album']['name']
-        duration = float(obj['duration_ms']) / 1000
-
-        return Song(title, artist, album, duration)
+        return self.__parse_lyrics(lyrics, type)
 
     def __ms_to_time(self, ms):
         mins = ms // 1000 // 60
@@ -64,6 +63,8 @@ class Spotify(Getter):
         return f"{mins:02d}:{secs:02d}.{ms:02d}"
 
     def __parse_lyrics(self, lyrics, type):
+        if not lyrics:
+            return None
         if type == 'synced':
             return self.__get_synced(lyrics)
         return self.__get_plain(lyrics)
@@ -82,130 +83,83 @@ class Spotify(Getter):
 
         return "\n".join([line['words'] for line in lines])
 
-    def __get_song_lyrics(self, track_url):
-        track_id = track_url.split('/')[-1]
+    def __get_song_lyrics(self, track_id):
         headers = {
             'Authorization': f'Bearer {self.lrc_token}',
-            'User-Agent': self.user_agent,
+            'User-Agent': self.USER_AGENT,
             'App-platform': 'WebPlayer',
             'Accept': 'application/json'
         }
+        url = f"{self.LRC_EP_HEAD}/{track_id}{self.LRC_EP_TAIL}"
 
-        response = requests.get(f"{self.lrc_ep}{track_id}{self.lrc_ep_end}", headers=headers)
+        body = self._get(url, headers=headers)
 
-        logger.debug(response.url)
-        if response.status_code == 404:
-            raise NoMatchFoundException("The song is on Spotify but the lyrics are not available, fallback to another provider")
-        if response.status_code != 200:
-            raise Exception(f"Failed to get lyrics, error code:{response.status_code}" + response.text)
-        
-        return response.json()
-
-    def __obtain_api_token(self):
-        if self.__validate('api'):
-            return
-        
-        token_infos = self.__get_api_token()
-        self.api_token = token_infos['access_token']
-
-        token_infos['generated_at'] = int(time())
-
-        with open(self.api_tok_file, 'w') as f:
-            json.dump(token_infos, f)
-
-    def __obtain_lrc_token(self):
-        if self.__validate('lrc'):
-            return
-        
-        token_infos = self.__get_lrc_token()
-        self.lrc_token = token_infos['accessToken']
-
-        with open(self.lrc_tok_file, 'w') as f:
-            json.dump(token_infos, f)
+        if not body:
+            return None
+        return body
 
     def __get_api_token(self):
-        # Get token from Spotify API
-        headers = {
-            'Content-Type': 'application/x-www-form-urlencoded'
-        }
-
+        token = self._find_token(self.api_tok_file)
+        if token and not self.api_token:
+            self.api_token = token
+            return
+        
+        headers = { 'Content-Type': 'application/x-www-form-urlencoded' }
         data = {
             'grant_type': 'client_credentials',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret
+            'client_id': self.CLIENT_ID,
+            'client_secret': self.CLIENT_SECRET
         }
+        url = self.API_TOK_EP
 
-        response = requests.post(self.api_tok_ep, headers=headers, data=data)
+        body = self._post(url, data, headers)
 
-        if response.status_code != 200:
-            raise Exception(f'Failed to get token, error code:{response.status_code}' + response.text)
+        if not body:
+            raise NoTokenException("Failed to get API token")
         
-        return response.json()
+        self.api_token = body['access_token']
+
+        body['token'] = body.pop('access_token') 
+        body['expires_at'] = int(time()) + body.pop('expires_in')
+
+        with open(self.api_tok_file, 'w') as f:
+            json.dump(body, f)
     
     def __get_lrc_token(self):
+        token = self._find_token(self.lrc_tok_file)
+        if token and not self.lrc_token:
+            self.lrc_token = token
+            return
+        
         headers = {
-            'User-Agent': self.user_agent,
+            'User-Agent': self.USER_AGENT,
             'App-platform': 'WebPlayer',
             'content-type': 'text/html; charset=utf-8',
-            'cookie': f"sp_dc={self.sp_dc}"
+            'cookie': f"sp_dc={self.SP_DC}"
         }
+        body = self._get(self.LRC_TOK_EP, headers=headers)
 
-        response = requests.get(self.lrc_tok_ep, headers=headers)
+        if not body or body['isAnonymous']:
+            raise NoTokenException("Failed to get LRC token")
+        
+        self.lrc_token = body['accessToken']
 
-        body = response.json()
-
-        if response.status_code != 200 or body['isAnonymous']:
-            raise Exception(f'Failed to get token, error code:{response.status_code}' + response.text)
-        
-        return body
-    
-    def __validate(self, token_type):
-        if token_type == 'api':
-            return self.__validate_api()
-        elif token_type == 'lrc':
-            return self.__validate_lrc()
-        
-        return False
-    
-    def __validate_api(self):
-        with open(self.api_tok_file, 'r') as f:
-            tok = json.load(f)
-
-        if int(time()) - tok['generated_at'] > tok['expires_in'] or not tok:
-            return False
-        
-        if not self.api_token:
-            self.api_token = tok['access_token']
-        return True
-    
-    def __validate_lrc(self):
-        with open(self.lrc_tok_file, 'r') as f:
-            tok = json.load(f)
-        
-        if int(time()) > (int(tok['accessTokenExpirationTimestampMs']) / 1000) or not tok:
-            return False
-        
-        if not self.lrc_token:
-            self.lrc_token = tok['accessToken']
-        return True
+        body['token'] = body.pop('accessToken')
+        body['expires_at'] = body.pop('accessTokenExpirationTimestampMs') // 1000
+        with open(self.lrc_tok_file, 'w') as f:
+            json.dump(body, f)
 
     def __search(self, track, artist):
         query = f'{track} artist:{artist}'
-        # Search for a song
-        headers = {
-            'Authorization': f'Bearer {self.api_token}'
-        }
-
+        headers = { 'Authorization': f'Bearer {self.api_token}' }
         params = {
             'q': query,
             'type': 'track'
         }
+        url = f"{self.API_EP}/search"
 
-        response = requests.get(f"{self.api_ep}/search", headers=headers, params=params)
+        body = self._get(url, params=params, headers=headers)
 
-        if response.status_code != 200:
-            raise Exception(f"Failed to get lyrics, error code:{response.status_code}" + response.text)
-        
-        tracks = response.json()['tracks']['items']
-
-        return tracks
+        if not body:
+            return None
+        return body['tracks']['items']
